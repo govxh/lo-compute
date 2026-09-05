@@ -30,6 +30,7 @@ jobs:
   worker:
     runs-on: windows-latest
     timeout-minutes: 360
+
     steps:
       - uses: actions/checkout@v4
 
@@ -94,3 +95,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install requests pillow pyautogui pygetwindow psutil
+
+      - name: Run LO worker (command loop)
+        shell: pwsh
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          LO_CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          LO_WORKER_ID: ${{ github.event.inputs.worker_id }}
+          LO_ROLE: ${{ github.event.inputs.role }}
+          LO_SOFTWARE: ${{ github.event.inputs.software }}
+          LO_RUN_ID: ${{ github.run_id }}
+          LO_MAX_MINUTES: "340"
+        run: |
+          python worker/lo_worker.py
