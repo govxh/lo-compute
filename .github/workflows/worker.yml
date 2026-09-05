@@ -1,0 +1,109 @@
+name: LO Worker
+on:
+  workflow_dispatch:
+    inputs:
+      worker_id:
+        description: "Worker id e.g. w1"
+        required: true
+        default: "w1"
+      channel_id:
+        description: "Discord channel id for this worker"
+        required: true
+      role:
+        description: "render | code | research | design | general"
+        required: false
+        default: "general"
+      software:
+        description: "comma list e.g. blender,ffmpeg,python"
+        required: false
+        default: ""
+      enable_rdp:
+        description: "true/false - human RDP takeover"
+        required: false
+        default: "true"
+      max_minutes:
+        description: "minutes before auto-checkpoint (default 300 = 5h)"
+        required: false
+        default: "300"
+concurrency:
+  group: lo-worker-${{ github.event.inputs.worker_id }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  worker:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create temporary random admin user
+        id: creds
+        shell: pwsh
+        run: |
+          $username = -join ((97..122)+(65..90) | Get-Random -Count 20 | ForEach-Object {[char]$_})
+          $password = -join ((65..90)+(97..122)+(48..57) | Get-Random -Count 20 | ForEach-Object {[char]$_})
+          Write-Output "::add-mask::$username"
+          Write-Output "::add-mask::$password"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "USER=$username"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "PASS=$password"
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name $username -Password $secure
+          Add-LocalGroupMember -Group Administrators -Member $username
+          Write-Host "Random admin user created"
+      - name: Enable RDP with NLA
+        if: ${{ github.event.inputs.enable_rdp == 'true' }}
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1
+      - name: Start bore tunnel for RDP and notify
+        if: ${{ github.event.inputs.enable_rdp == 'true' }}
+        shell: pwsh
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          RDPUSER: ${{ steps.creds.outputs.USER }}
+          RDPPASS: ${{ steps.creds.outputs.PASS }}
+          WID: ${{ github.event.inputs.worker_id }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WEBHOOK_URL)) { Write-Host "no webhook"; exit 0 }
+          Add-MpPreference -ExclusionPath "$PWD\bore" -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri 'https://github.com/ekzhang/bore/releases/download/v0.5.0/bore-v0.5.0-x86_64-pc-windows-msvc.zip' -OutFile bore.zip -UseBasicParsing
+          Expand-Archive bore.zip -DestinationPath ./bore -Force
+          $exe = Join-Path $PWD 'bore/bore.exe'
+          Start-Process -FilePath $exe -ArgumentList 'local','3389','--to','bore.pub','--port','0' -RedirectStandardOutput "$PWD/bore_out.log" -RedirectStandardError "$PWD/bore_err.log" -NoNewWindow
+          Start-Sleep -Seconds 10
+          $tunnel = $null
+          for ($i=1; $i -le 12; $i++) {
+            foreach ($f in @("$PWD/bore_out.log","$PWD/bore_err.log")) {
+              if (Test-Path $f) {
+                $log = Get-Content $f -Raw
+                if ($log -match 'listening at bore\.pub:(\d+)') { $tunnel = "bore.pub:$($matches[1])"; break }
+              }
+            }
+            if ($tunnel) { break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $tunnel) { Write-Host "tunnel not ready"; exit 0 }
+          $msg = "LO RDP READY [$env:WID]`nAddress: $tunnel`nUser: $env:RDPUSER`nPass: $env:RDPPASS"
+          $body = @{ content = $msg } | ConvertTo-Json
+          Invoke-RestMethod -Uri $env:WEBHOOK_URL -Method Post -Body $body -ContentType 'application/json' | Out-Null
+      - name: Install worker deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pillow pyautogui pygetwindow psutil
+      - name: Run LO worker (command loop)
+        shell: pwsh
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          LO_CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          LO_WORKER_ID: ${{ github.event.inputs.worker_id }}
+          LO_ROLE: ${{ github.event.inputs.role }}
+          LO_SOFTWARE: ${{ github.event.inputs.software }}
+          LO_RUN_ID: ${{ github.run_id }}
+          LO_MAX_MINUTES: ${{ github.event.inputs.max_minutes }}
+          LO_STORAGE_TOKEN: ${{ secrets.STORAGE_TOKEN }}
+          LO_STORAGE_REPO: lo-storage
+        run: |
+          python worker/lo_worker.py
