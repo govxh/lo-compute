@@ -38,8 +38,6 @@ def reply(cid, ok, out="", err="", extra=None):
 def minutes_left():
     return max(0, MAXMIN - int((time.time() - START) / 60))
 
-# ---------------- command handlers ----------------
-
 def h_shell(a):
     p = subprocess.run(["powershell", "-NoProfile", "-Command", a["cmd"]],
                        capture_output=True, text=True,
@@ -158,8 +156,6 @@ HANDLERS = {
     "INSTALL": h_install, "UPLOAD": h_upload, "STATUS": h_status,
 }
 
-# ---------------- main loop ----------------
-
 def fetch_new():
     global LAST_ID
     params = {"limit": 25}
@@ -173,15 +169,12 @@ def fetch_new():
     return [m for m in msgs if (m.get("content") or "").startswith(">>")]
 
 def main():
-    # seed LAST_ID so purane commands dobara na chalein
     r = requests.get(f"{API}/channels/{CHANNEL}/messages",
                      headers=HDR, params={"limit": 1}, timeout=30)
     if r.status_code == 200 and r.json():
         globals()["LAST_ID"] = r.json()[0]["id"]
-
     post(f"<< ONLINE {json.dumps({'w':WID,'run_id':RUN_ID,'minutes_left':minutes_left(),'role':os.environ.get('LO_ROLE','general')})}")
     last_hb = time.time()
-
     while True:
         if minutes_left() <= 3:
             post(f"<< EXPIRING {json.dumps({'w':WID})}")
