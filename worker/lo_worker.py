@@ -1,4 +1,4 @@
-import os, sys, io, json, time, base64, subprocess, traceback, socket
+import os, sys, io, json, time, base64, subprocess, traceback, socket, zipfile
 import requests
 
 TOKEN   = os.environ["DISCORD_BOT_TOKEN"]
@@ -10,6 +10,19 @@ API     = "https://discord.com/api/v10"
 HDR     = {"Authorization": f"Bot {TOKEN}"}
 START   = time.time()
 LAST_ID = None
+
+# Storage Config
+STORAGE_TOKEN = os.environ.get("STORAGE_TOKEN", "")
+REPO = os.environ.get("GITHUB_REPOSITORY", "")
+STORAGE_OWNER = REPO.split("/")[0] if "/" in REPO else ""
+STORAGE_REPO_NAME = "lo-storage"
+
+def gh_api(method, path, **kwargs):
+    url = f"https://api.github.com{path}"
+    headers = {"Authorization": f"token {STORAGE_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    if "headers" in kwargs:
+        headers.update(kwargs.pop("headers"))
+    return requests.request(method, url, headers=headers, timeout=60, **kwargs)
 
 def post(text):
     for i in range(0, max(len(text), 1), 1900):
@@ -132,7 +145,12 @@ def h_upload(a):
     path = a["path"]
     size = os.path.getsize(path)
     if size > 9_000_000:
-        return False, "", f"file too big for bus ({size}B). Use release upload."
+        dest = os.path.basename(path)
+        ok, out, err = h_gh_upload({"path": path, "dest": dest, "folder": "artifacts"})
+        if ok:
+            return True, f"uploaded large file to storage: {dest}", ""
+        return False, "", f"large file upload failed: {err}"
+    
     with open(path, "rb") as f:
         post_file(os.path.basename(path), f.read(),
                   f"<< FILE {a.get('_id','')} {os.path.basename(path)} {size}B")
@@ -148,12 +166,154 @@ def h_status(a):
         "host": socket.gethostname(), "cwd": os.getcwd(),
     }), ""
 
+# --- PHASE 2 HANDLERS ---
+
+def h_gh_upload(a):
+    path = a["path"]
+    dest = a.get("dest", os.path.basename(path))
+    folder = a.get("folder", "artifacts")
+    size = os.path.getsize(path)
+    
+    if size < 25_000_000:
+        with open(path, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode()
+        sha = None
+        r = gh_api("GET", f"/repos/{STORAGE_OWNER}/{STORAGE_REPO_NAME}/contents/{folder}/{dest}")
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+        body = {"message": f"upload {dest}", "content": content_b64}
+        if sha: body["sha"] = sha
+        r = gh_api("PUT", f"/repos/{STORAGE_OWNER}/{STORAGE_REPO_NAME}/contents/{folder}/{dest}", json=body)
+        if r.status_code in (200, 201):
+            return True, f"uploaded to {folder}/{dest} ({size}B)", ""
+        return False, "", f"Contents API failed: {r.status_code} {r.text}"
+    else:
+        rel_id = None
+        r = gh_api("GET", f"/repos/{STORAGE_OWNER}/{STORAGE_REPO_NAME}/releases/tags/storage")
+        if r.status_code == 200:
+            rel_id = r.json()["id"]
+        else:
+            r = gh_api("POST", f"/repos/{STORAGE_OWNER}/{STORAGE_REPO_NAME}/releases",
+                       json={"tag_name": "storage", "name": "storage", "body": "lo-storage"})
+            if r.status_code == 201:
+                rel_id = r.json()["id"]
+            else:
+                return False, "", f"Release create failed: {r.text}"
+        upload_url = f"https://uploads.github.com/repos/{STORAGE_OWNER}/{STORAGE_REPO_NAME}/releases/{rel_id}/assets?name={dest}"
+        with open(path, "rb") as f:
+            r = requests.post(upload_url,
+                              headers={"Authorization": f"token {STORAGE_TOKEN}", "Content-Type": "application/octet-stream"},
+                              data=f, timeout=300)
+        if r.status_code == 201:
+            return True, f"uploaded release asset {dest} ({size}B)", ""
+        return False, "", f"Release upload failed: {r.status_code} {r.text}"
+
+def h_gh_download(a):
+    path = a["path"]
+    save_as = a.get("save_as", os.path.basename(path))
+    r = gh_api("GET", f"/repos/{STORAGE_OWNER}/{STORAGE_REPO_NAME}/contents/{path}")
+    if r.status_code == 200:
+        data = r.json()
+        if data.get("encoding") == "base64":
+            content = base64.b64decode(data["content"])
+        else:
+            r2 = requests.get(data["download_url"], headers={"Authorization": f"token {STORAGE_TOKEN}"})
+            content = r2.content
+        with open(save_as, "wb") as f:
+            f.write(content)
+        return True, f"downloaded {len(content)} bytes -> {save_as}", ""
+    
+    r = gh_api("GET", f"/repos/{STORAGE_OWNER}/{STORAGE_REPO_NAME}/releases/tags/storage")
+    if r.status_code == 200:
+        assets = r.json().get("assets", [])
+        for asset in assets:
+            if asset["name"] == path or asset["name"] == os.path.basename(path):
+                r2 = requests.get(asset["url"],
+                                  headers={"Authorization": f"token {STORAGE_TOKEN}", "Accept": "application/octet-stream"})
+                if r2.status_code == 200:
+                    with open(save_as, "wb") as f:
+                        f.write(r2.content)
+                    return True, f"downloaded asset {len(r2.content)} bytes -> {save_as}", ""
+    return False, "", f"file not found in storage: {path}"
+
+def h_checkpoint(a):
+    folder = a.get("folder", "work")
+    if not os.path.exists(folder): folder = "."
+    zip_name = f"checkpoints/{WID}_{int(time.time())}.zip"
+    local_zip = f"_lo_ckpt_{WID}.zip"
+    with zipfile.ZipFile(local_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(folder):
+            for file in files:
+                fp = os.path.join(root, file)
+                arcname = os.path.relpath(fp, folder)
+                zf.write(fp, arcname)
+    res_ok, res_out, res_err = h_gh_upload({"path": local_zip, "dest": os.path.basename(zip_name), "folder": "checkpoints"})
+    os.remove(local_zip)
+    if res_ok:
+        return True, f"checkpoint saved to {zip_name}", ""
+    return False, "", f"checkpoint upload failed: {res_err}"
+
+def h_restore(a):
+    path = a["path"]
+    save_as = "_lo_restore.zip"
+    ok, out, err = h_gh_download({"path": path, "save_as": save_as})
+    if not ok: return False, "", err
+    folder = a.get("folder", "work")
+    os.makedirs(folder, exist_ok=True)
+    with zipfile.ZipFile(save_as, "r") as zf:
+        zf.extractall(folder)
+    os.remove(save_as)
+    return True, f"restored to {folder}", ""
+
+def h_download_url(a):
+    url = a["url"]
+    save_as = a.get("save_as", os.path.basename(url) or "downloaded_file")
+    r = requests.get(url, timeout=300)
+    if r.status_code == 200:
+        with open(save_as, "wb") as f:
+            f.write(r.content)
+        return True, f"downloaded {len(r.content)} bytes -> {save_as}", ""
+    return False, "", f"download failed: {r.status_code}"
+
+def h_zip(a):
+    src = a["src"]
+    dest = a.get("dest", f"{src}.zip")
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+        if os.path.isdir(src):
+            for root, dirs, files in os.walk(src):
+                for file in files:
+                    fp = os.path.join(root, file)
+                    arcname = os.path.relpath(fp, os.path.dirname(src))
+                    zf.write(fp, arcname)
+        else:
+            zf.write(src, os.path.basename(src))
+    return True, f"zipped to {dest}", ""
+
+def h_unzip(a):
+    src = a["src"]
+    dest = a.get("dest", ".")
+    with zipfile.ZipFile(src, "r") as zf:
+        zf.extractall(dest)
+    return True, f"unzipped to {dest}", ""
+
+def h_git(a):
+    cmd = a["cmd"]
+    p = subprocess.run(["git"] + cmd.split(), capture_output=True, text=True, timeout=1800)
+    return p.returncode == 0, p.stdout, p.stderr
+
+def h_start_vnc(a):
+    return True, "VNC setup triggered (placeholder)", ""
+
 HANDLERS = {
     "SHELL": h_shell, "PYTHON": h_python, "WRITE_FILE": h_write_file,
     "READ_FILE": h_read_file, "LIST_DIR": h_list_dir,
     "SCREENSHOT": h_screenshot, "CLICK": h_click, "TYPE": h_type,
     "KEY": h_key, "MOVE": h_move, "OPEN_APP": h_open_app,
     "INSTALL": h_install, "UPLOAD": h_upload, "STATUS": h_status,
+    "DOWNLOAD_URL": h_download_url, "ZIP": h_zip, "UNZIP": h_unzip,
+    "GIT": h_git, "CHECKPOINT": h_checkpoint, "RESTORE": h_restore,
+    "GH_UPLOAD": h_gh_upload, "GH_DOWNLOAD": h_gh_download,
+    "START_VNC": h_start_vnc,
 }
 
 def fetch_new():
@@ -179,6 +339,16 @@ def main():
         if minutes_left() <= 3:
             post(f"<< EXPIRING {json.dumps({'w':WID})}")
             return
+            
+        if minutes_left() <= 30 and not getattr(main, "ckpt_done", False):
+            post(f"<< AUTO_CHECKPOINT {json.dumps({'w':WID})}")
+            try:
+                ok, out, err = h_checkpoint({})
+                if ok:
+                    main.ckpt_done = True
+            except Exception:
+                pass
+
         try:
             for m in fetch_new():
                 raw = m["content"][2:].strip()
