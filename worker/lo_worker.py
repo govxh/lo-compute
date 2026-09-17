@@ -5,7 +5,7 @@ TOKEN   = os.environ["DISCORD_BOT_TOKEN"]
 CHANNEL = os.environ["LO_CHANNEL_ID"]
 WID     = os.environ.get("LO_WORKER_ID", "w1")
 RUN_ID  = os.environ.get("LO_RUN_ID", "")
-MAXMIN  = int(os.environ.get("LO_MAX_MINUTES", "340"))
+MAXMIN  = int(os.environ.get("LO_MAX_MINUTES", "300"))
 API     = "https://discord.com/api/v10"
 HDR     = {"Authorization": f"Bot {TOKEN}"}
 START   = time.time()
@@ -52,16 +52,18 @@ def minutes_left():
     return max(0, MAXMIN - int((time.time() - START) / 60))
 
 def h_shell(a):
+    timeout = a.get("timeout_sec") or a.get("timeout") or 600
     p = subprocess.run(["powershell", "-NoProfile", "-Command", a["cmd"]],
                        capture_output=True, text=True,
-                       timeout=a.get("timeout", 600), cwd=a.get("cwd") or None)
+                       timeout=timeout, cwd=a.get("cwd") or None)
     return p.returncode == 0, p.stdout, p.stderr
 
 def h_python(a):
     with open("_lo_tmp.py", "w", encoding="utf-8") as f:
         f.write(a["code"])
+    timeout = a.get("timeout_sec") or a.get("timeout") or 900
     p = subprocess.run([sys.executable, "_lo_tmp.py"], capture_output=True,
-                       text=True, timeout=a.get("timeout", 900))
+                       text=True, timeout=timeout)
     return p.returncode == 0, p.stdout, p.stderr
 
 def h_write_file(a):
@@ -100,13 +102,6 @@ def h_screenshot(a):
               f"<< SHOT {a.get('_id','')} real={w}x{h} shown={img.size[0]}x{img.size[1]}")
     return True, f"screenshot sent real={w}x{h}", ""
 
-def h_click(a):
-    import pyautogui
-    pyautogui.moveTo(a["x"], a["y"], duration=0.15)
-    pyautogui.click(clicks=2 if a.get("double") else 1,
-                    button=a.get("button", "left"))
-    return True, f"clicked {a['x']},{a['y']}", ""
-
 def h_type(a):
     import pyautogui
     pyautogui.write(a["text"], interval=a.get("interval", 0.02))
@@ -114,32 +109,67 @@ def h_type(a):
 
 def h_key(a):
     import pyautogui
-    keys = [k.strip() for k in a["combo"].split("+")]
-    pyautogui.hotkey(*keys)
-    return True, f"key {a['combo']}", ""
+    combo = str(a.get("keys") or a.get("combo") or "").strip()
+    if not combo:
+        return False, "", "missing keys"
+    parts = [p.strip().lower() for p in combo.replace("+", ",").split(",") if p.strip()]
+    if len(parts) > 1:
+        pyautogui.hotkey(*parts)
+    else:
+        pyautogui.press(parts[0])
+    return True, f"pressed {combo}", ""
 
-def h_move(a):
-    import pyautogui
-    pyautogui.moveTo(a["x"], a["y"], duration=0.15)
-    return True, "moved", ""
+def h_scroll(a):
+    """Scroll the active window. Positive amount = up, negative = down."""
+    try:
+        amt = int(a.get("amount", 0) or 0)
+    except Exception:
+        return False, "", "amount must be an integer"
+    if amt == 0:
+        return True, "nothing to scroll (amount=0)", ""
+    try:
+        import pyautogui
+        pyautogui.scroll(amt)
+        return True, f"scrolled {amt}", ""
+    except Exception as e:
+        return False, "", f"scroll failed: {e}"
 
 def h_open_app(a):
+    target = a.get("name") or a.get("target")
+    if not target:
+        return False, "", "missing app name"
     subprocess.Popen(["powershell", "-NoProfile", "-Command",
-                      f"Start-Process '{a['target']}'"])
+                      f"Start-Process '{target}'"])
     time.sleep(a.get("wait", 6))
-    return True, f"launched {a['target']}", ""
+    return True, f"launched {target}", ""
 
 def h_install(a):
-    mgr, pkg = a.get("manager", "winget"), a["package"]
-    cmds = {
-        "winget": f"winget install --id {pkg} --silent --accept-package-agreements --accept-source-agreements",
-        "choco":  f"choco install {pkg} -y --no-progress",
-        "pip":    f"{sys.executable} -m pip install {pkg}",
-        "npm":    f"npm install -g {pkg}",
-    }
-    p = subprocess.run(["powershell", "-NoProfile", "-Command", cmds[mgr]],
-                       capture_output=True, text=True, timeout=1800)
-    return p.returncode == 0, p.stdout, p.stderr
+    mgr = a.get("manager", "winget")
+    pkgs = a.get("packages") or ([a["package"]] if a.get("package") else [])
+    if isinstance(pkgs, str):
+        pkgs = [pkgs]
+    if not pkgs:
+        return False, "", "missing packages"
+    timeout = a.get("timeout_sec") or a.get("timeout") or 1800
+    outs, errs, failed = [], [], []
+    for pkg in pkgs:
+        cmds = {
+            "winget": f"winget install --id {pkg} --silent --accept-package-agreements --accept-source-agreements",
+            "choco":  f"choco install {pkg} -y --no-progress",
+            "pip":    f"{sys.executable} -m pip install {pkg}",
+            "npm":    f"npm install -g {pkg}",
+        }
+        if mgr not in cmds:
+            return False, "", f"unknown manager {mgr}"
+        p = subprocess.run(["powershell", "-NoProfile", "-Command", cmds[mgr]],
+                           capture_output=True, text=True, timeout=timeout)
+        outs.append(f"== {pkg} ==\n" + p.stdout)
+        if p.stderr:
+            errs.append(f"== {pkg} ==\n" + p.stderr)
+        if p.returncode != 0:
+            failed.append(pkg)
+    ok = not failed
+    return ok, "\n".join(outs), ("failed: " + ", ".join(failed) + "\n" if failed else "") + "\n".join(errs)
 
 def h_upload(a):
     path = a["path"]
@@ -301,20 +331,26 @@ def h_git(a):
     p = subprocess.run(["git"] + cmd.split(), capture_output=True, text=True, timeout=1800)
     return p.returncode == 0, p.stdout, p.stderr
 
-def h_start_vnc(a):
-    return True, "VNC setup triggered (placeholder)", ""
-
 HANDLERS = {
     "SHELL": h_shell, "PYTHON": h_python, "WRITE_FILE": h_write_file,
     "READ_FILE": h_read_file, "LIST_DIR": h_list_dir,
-    "SCREENSHOT": h_screenshot, "CLICK": h_click, "TYPE": h_type,
-    "KEY": h_key, "MOVE": h_move, "OPEN_APP": h_open_app,
+    "SCREENSHOT": h_screenshot, "TYPE": h_type,
+    "KEY": h_key, "SCROLL": h_scroll, "OPEN_APP": h_open_app,
     "INSTALL": h_install, "UPLOAD": h_upload, "STATUS": h_status,
     "DOWNLOAD_URL": h_download_url, "ZIP": h_zip, "UNZIP": h_unzip,
     "GIT": h_git, "CHECKPOINT": h_checkpoint, "RESTORE": h_restore,
     "GH_UPLOAD": h_gh_upload, "GH_DOWNLOAD": h_gh_download,
-    "START_VNC": h_start_vnc,
 }
+
+def _sysinfo():
+    """Best-effort cpu/ram strings for the ONLINE announcement."""
+    try:
+        import psutil
+        cpu = psutil.cpu_count(logical=True) or 0
+        ram_gb = round(psutil.virtual_memory().total / (1024 ** 3), 1)
+        return f"{cpu} cores", f"{ram_gb} GB"
+    except Exception:
+        return "?", "?"
 
 def fetch_new():
     global LAST_ID
@@ -333,7 +369,8 @@ def main():
                      headers=HDR, params={"limit": 1}, timeout=30)
     if r.status_code == 200 and r.json():
         globals()["LAST_ID"] = r.json()[0]["id"]
-    post(f"<< ONLINE {json.dumps({'w':WID,'run_id':RUN_ID,'minutes_left':minutes_left(),'role':os.environ.get('LO_ROLE','general')})}")
+    _cpu, _ram = _sysinfo()
+    post(f"<< ONLINE {json.dumps({'w':WID,'run_id':RUN_ID,'minutes_left':minutes_left(),'role':os.environ.get('LO_ROLE','general'),'cpu':_cpu,'ram':_ram})}")
     last_hb = time.time()
     while True:
         if minutes_left() <= 3:
