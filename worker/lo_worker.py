@@ -331,6 +331,143 @@ def h_git(a):
     p = subprocess.run(["git"] + cmd.split(), capture_output=True, text=True, timeout=1800)
     return p.returncode == 0, p.stdout, p.stderr
 
+# ----------------------------------------------------------------------
+# Semantic Operator Protocol v1 (coordinate-free UI control)
+# ----------------------------------------------------------------------
+# Implementation status (honest): the batch envelope, coordinate-ban
+# validation, exec_shell/press delegation and the per-action report format
+# are implemented here. UI-tree snapshot + node resolution need a real
+# accessibility backend (Windows UI Automation, e.g. the `uiautomation`
+# or `pywinauto` package — not installed on the runner); until that
+# backend lands, click/type/select/scroll_to/wait_for/snapshot return
+# structured per-action "unsupported" errors and the Android app shows
+# the session as NO-OP instead of faking success. Never add pixel
+# coordinates here: the protocol is coordinate-free by design.
+# ----------------------------------------------------------------------
+OPERATOR_PROTOCOL_URN = "urn:lo:semantic-operator/v1"
+OPERATOR_MAX_ACTIONS = 64
+_OPERATOR_BANNED_KEYS = {"x", "y", "point", "bounds", "rect", "coords",
+                         "coordinates", "position", "location"}
+
+def _operator_reject_coordinates(obj):
+    """Recursively reject anything shaped like pixel coordinates."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k).lower() in _OPERATOR_BANNED_KEYS:
+                raise ValueError("coordinate key rejected: %s" % k)
+            _operator_reject_coordinates(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _operator_reject_coordinates(v)
+
+def _operator_action_result(index, ok, resolved_node=None,
+                            resolved_by=None, error=None, output=None):
+    r = {"index": index, "ok": bool(ok)}
+    if resolved_node:
+        r["resolved_node"] = resolved_node
+    if resolved_by:
+        r["resolved_by"] = resolved_by
+    if error:
+        r["error"] = error
+    if output:
+        r["output"] = output
+    return r
+
+def _operator_snapshot_tree():
+    """Return (ok, tree_or_error). Needs a UIA backend (not installed)."""
+    return False, ("unsupported: no accessibility backend installed "
+                   "(needs Windows UI Automation, e.g. `uiautomation`); "
+                   "snapshot unavailable")
+
+def _operator_resolve_node(selector):
+    return False, ("unsupported: node resolution needs a UI-tree snapshot; "
+                   "no accessibility backend installed"), None
+
+def _operator_run_action(index, act, kind):
+    if kind == "exec_shell":
+        # Already approval-gated on the Android side before dispatch.
+        ok, out, err = h_shell({"cmd": act.get("command", ""),
+                                "timeout": (act.get("timeout_ms") or 60000) / 1000.0})
+        if ok:
+            return _operator_action_result(index, True, output=(out or "")[-2000:])
+        return _operator_action_result(index, False,
+                                       error=(err or out or "shell failed")[-500:])
+    if kind == "press":
+        ok, _out, err = h_key({"keys": act.get("keys") or ""})
+        if ok:
+            return _operator_action_result(index, True)
+        return _operator_action_result(index, False, error=(err or "press failed")[-500:])
+    if kind == "snapshot":
+        ok, payload = _operator_snapshot_tree()
+        if ok:
+            return _operator_action_result(index, True,
+                                           output=json.dumps(payload)[:2000])
+        return _operator_action_result(index, False, error=payload)
+    if kind in ("click", "type", "select", "scroll_to", "wait_for"):
+        _ok, err, _node = _operator_resolve_node(act.get("target") or {})
+        return _operator_action_result(index, False, error=err)
+    return _operator_action_result(index, False,
+                                   error="unknown action kind: %s" % kind)
+
+def h_operator_batch(a):
+    """OPERATOR_BATCH: run one Semantic Operator Protocol v1 batch."""
+    try:
+        batch = a if isinstance(a, dict) else {}
+        if batch.get("protocol") != OPERATOR_PROTOCOL_URN:
+            return False, "", "unsupported protocol: %s" % batch.get("protocol")
+        batch_id = batch.get("batch_id") or a.get("_id") or "?"
+        actions = batch.get("actions") or []
+        # Defense in depth: the app validates before dispatch; the worker
+        # validates again and refuses anything coordinate-shaped.
+        try:
+            _operator_reject_coordinates(batch)
+        except ValueError as e:
+            return False, "", "coordinate payload rejected: %s" % e
+        if len(actions) > OPERATOR_MAX_ACTIONS:
+            return False, "", "batch too large (max %d actions)" % OPERATOR_MAX_ACTIONS
+        results = []
+        for i, act in enumerate(actions):
+            kind = (act.get("kind") or "").lower()
+            t0 = time.time()
+            try:
+                res = _operator_run_action(i, act, kind)
+            except Exception:
+                res = _operator_action_result(i, False,
+                                              error=traceback.format_exc()[-500:])
+            res["ms"] = int((time.time() - t0) * 1000)
+            results.append(res)
+        # NOTE: reply() truncates out to 3500 chars, so tree payloads must
+        # travel as small diffs (tree_diff), never full dumps, on this bus.
+        # Field names match the Android parser (op_results / resolved_node /
+        # resolved_by / ms); do not rename them unilaterally.
+        out = json.dumps({"protocol": OPERATOR_PROTOCOL_URN,
+                          "batch_id": batch_id, "op_results": results},
+                         separators=(",", ":"))
+        return True, out, ""
+    except Exception:
+        return False, "", traceback.format_exc()[-1000:]
+
+def _operator_bootstrap():
+    """Run the optional operator_actions batch from LO_OPERATOR_ACTIONS."""
+    raw = (os.environ.get("LO_OPERATOR_ACTIONS") or "").strip()
+    if not raw:
+        return
+    try:
+        batch = json.loads(raw)
+    except Exception as e:
+        post("<< OPERATOR_BOOTSTRAP " + json.dumps(
+            {"w": WID, "ok": False, "err": "invalid operator_actions JSON: %s" % e}))
+        return
+    ok, out, err = h_operator_batch(batch)
+    summary = {"w": WID, "ok": ok, "err": (err or "")[-500:]}
+    try:
+        rep = json.loads(out) if out else {}
+        summary["actions_ok"] = sum(1 for r in rep.get("op_results", []) if r.get("ok"))
+        summary["actions_total"] = len(rep.get("op_results", []))
+    except Exception:
+        pass
+    post("<< OPERATOR_BOOTSTRAP " + json.dumps(summary))
+
 HANDLERS = {
     "SHELL": h_shell, "PYTHON": h_python, "WRITE_FILE": h_write_file,
     "READ_FILE": h_read_file, "LIST_DIR": h_list_dir,
@@ -340,6 +477,7 @@ HANDLERS = {
     "DOWNLOAD_URL": h_download_url, "ZIP": h_zip, "UNZIP": h_unzip,
     "GIT": h_git, "CHECKPOINT": h_checkpoint, "RESTORE": h_restore,
     "GH_UPLOAD": h_gh_upload, "GH_DOWNLOAD": h_gh_download,
+    "OPERATOR_BATCH": h_operator_batch,
 }
 
 def _sysinfo():
@@ -371,6 +509,12 @@ def main():
         globals()["LAST_ID"] = r.json()[0]["id"]
     _cpu, _ram = _sysinfo()
     post(f"<< ONLINE {json.dumps({'w':WID,'run_id':RUN_ID,'minutes_left':minutes_left(),'role':os.environ.get('LO_ROLE','general'),'cpu':_cpu,'ram':_ram})}")
+    # Semantic Operator Protocol: run the optional bootstrap batch delivered
+    # via the operator_actions workflow input (LO_OPERATOR_ACTIONS).
+    try:
+        _operator_bootstrap()
+    except Exception:
+        traceback.print_exc()
     last_hb = time.time()
     while True:
         if minutes_left() <= 3:

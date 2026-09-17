@@ -22,6 +22,10 @@ on:
         description: "Max minutes to run (default 300)"
         required: false
         default: "300"
+      operator_actions:
+        description: "Optional Semantic Operator Protocol v1 batch JSON (validated by the app before dispatch; coordinate-free)"
+        required: false
+        default: ""
 
 concurrency:
   group: lo-worker-${{ github.event.inputs.worker_id }}
@@ -85,6 +89,7 @@ jobs:
           LO_ROLE: ${{ github.event.inputs.role }}
           LO_RUN_ID: ${{ github.run_id }}
           LO_MAX_MINUTES: ${{ github.event.inputs.max_minutes }}
+          LO_OPERATOR_ACTIONS: ${{ github.event.inputs.operator_actions }}
           STORAGE_TOKEN: ${{ secrets.STORAGE_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
